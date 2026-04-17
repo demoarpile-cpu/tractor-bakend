@@ -6,156 +6,148 @@
 
 A booking must follow this strict sequence. Status transitions cannot be skipped.
 
-1. Pending (Farmer creates a booking request + System snapshots hub/service metadata)
-   - *Optional*: Farmer selects payment intent (Full/Partial/Later)
-   - *Result*: Initial Payment record created if Full/Partial chosen.
-2. Scheduled (Admin sets official deployment Date & Time)
-3. Dispatched (aka ASSIGNED) (Admin assigns tractor and operator)
-4. En Route (Operator starts journey)
-5. In Progress (Operator starts work)
-6. Completed (Operator finishes work)
-7. Paid (Payment confirmed)
+1. **PENDING** (Farmer creates a booking request)
+   - System calculates price (Zone-based or Fuel-based)
+   - System snapshots hub/service metadata into the Booking record
+   - **Mandatory Digital Payment**: Farmer must select 'Full' or 'Partial' (50%) payment.
+   - **Pay to Book**: Booking created via `checkout` which ensures payment is recorded.
+   - Booking created with `status: PENDING`, `paymentStatus: PARTIAL` or `PAID`.
+
+2. **SCHEDULED** (Admin sets official deployment Date & Time)
+   - Admin reviews pending booking and sets `scheduledAt`
+   - Farmer receives notification about scheduling
+
+3. **ASSIGNED** (Admin assigns operator + tractor)
+   - Admin selects an available operator (auto-links their tractor)
+   - Atomic transaction: booking → ASSIGNED, operator → busy, tractor → IN_USE
+   - Both operator and farmer receive notifications
+
+4. **IN_PROGRESS** (Operator starts work on-site)
+   - Operator updates status from ASSIGNED → IN_PROGRESS
+   - Real-time location tracking active via Socket.IO
+
+5. **COMPLETED** (Operator finishes work)
+   - Atomic transaction:
+     - Booking status → COMPLETED
+     - Operator availability → available
+     - Tractor status → AVAILABLE
 
 ---
 
-## 2. Status Transition Rules
+## 2. Payment Status Flow (Decoupled)
+
+Payment status is tracked **independently** from the booking work status via `paymentStatus`.
+
+| Payment Status | Condition |
+|:---|:---|
+| **PENDING** | No payments recorded yet (Initial state for draft bookings) |
+| **PARTIAL** | Total paid ≥ 50% of finalPrice |
+| **PAID** | Total paid ≥ 100% of finalPrice |
+
+- Multiple payments per booking are supported.
+- `paymentStatus` is automatically recalculated on each payment.
+- Payments are **digital only**. Admin manual settlement is **disabled** for security.
+
+---
+
+## 3. Pricing Logic & Terrain Factor
+
+Pricing is calculated using one of two modes defined in `SystemConfig`:
+
+### 3.1 Terrain Factor
+All distance calculations use a **1.3 Terrain Factor** (Client Requirement) to account for road distances vs air distances.
+`roadDistance = airDistance * 1.3`
+
+### 3.2 Pricing Modes
+1.  **ZONE (Default)**:
+    - Matches `roadDistance` against active distance zones.
+    - `distanceCharge = zone.surchargePerHectare * landSize`
+2.  **FUEL**:
+    - Dynamic pricing based on current diesel price.
+    - `fuel_index = diesel_price / 800`
+    - `per_km_rate = 750 * fuel_index`
+    - `distanceCharge = per_km_rate * roadDistance`
+
+---
+
+## 4. Status Transition Rules
+
+### 4.1 Booking Status Transitions
 
 | Current Status | Next Allowed Status | Action | Actor |
-|----------------|-------------------|--------|-------|
-| None | Pending | Create Booking | Farmer |
-| Pending | Scheduled | Approve & Schedule | Admin |
-| Scheduled | Dispatched / Cancelled | Assign Resources | Admin |
-| Dispatched | En Route | Start Journey | Operator |
-| En Route | In Progress | Start Work | Operator |
-| In Progress | Completed | Finish Work | Operator |
-| Completed | Paid (Settled) | Confirm Settlement | Admin |
-| Paid | - | Final State | - |
+|:---|:---|:---|:---|
+| *(none)* | PENDING | Create Booking | Farmer |
+| PENDING | SCHEDULED | Schedule (set date/time) | Admin |
+| SCHEDULED | ASSIGNED | Assign Operator + Tractor | Admin |
+| ASSIGNED | IN_PROGRESS | Start Work | Operator |
+| IN_PROGRESS | COMPLETED | Finish Work | Operator |
 
----
-
-## 3. Strict Business Rules
-
-### 3.1 No Skipping Steps
-- Status must follow defined order
-- Invalid transitions must return `INVALID_TRANSITION`
-
----
-
-### 3.2 Resource Locking
-
-- At `Dispatched`:
-  - Tractor → Busy
-  - Operator → Busy
-
-- At `Completed`:
-  - Tractor → Available
-  - Operator → Available
-
----
-
-### 3.3 Cancellation Rules
-
-- Booking can be cancelled only in `Scheduled` state
-- After `Dispatched`, only Admin can cancel
-
----
-
-### 3.4 Pricing & Settlement
-- Price at `Scheduled` is an estimate.
-- **Data Snapshot**: During booking creation (`Scheduled`), the system snapshots the current Hub Name, Location, Coordinates, and Service Name to the `Booking` record.
-- Settlement is triggered by **Admin Only** in Phase 1.
-- Marking as "Paid" creates a physical ledger entry (`admin_settlement`).
-
----
-
-### 3.5 Actor Validation
-
-Only specific roles can update status:
-
-- Farmer → Can create booking
-- Admin → Can dispatch, cancel, mark paid
-- Operator → Can update job progress
-
-Invalid role action must return `FORBIDDEN`
-
----
-
-### 3.6 Idempotency Protection
-
-- Repeating the same status update should not break system
-- If status is already updated, return success without duplication
-
----
-
-## 4. Status Transition Validator (Backend Logic)
+### 4.2 Status Transition Validator (Current Code)
 
 ```javascript
 const allowedTransitions = {
-  scheduled: ['dispatched', 'cancelled'],
-  dispatched: ['en_route'],
-  en_route: ['in_progress'],
-  in_progress: ['completed'],
-  completed: ['paid'],
-  paid: [],
-  cancelled: []
+  SCHEDULED: ['ASSIGNED'],
+  ASSIGNED: ['IN_PROGRESS'],
+  IN_PROGRESS: ['COMPLETED'],
+  COMPLETED: []
 };
-
-function validateStatusChange(current, next) {
-  if (!allowedTransitions[current]?.includes(next)) {
-    throw new Error("INVALID_TRANSITION");
-  }
-}
 ```
 
 ---
 
-## 5. Actor-Based Validation (Important)
+## 5. Strict Business Rules
 
-```javascript
-function validateActor(role, nextStatus) {
-  const rules = {
-    farmer: ['scheduled'],
-    admin: ['dispatched', 'cancelled', 'paid'],
-    operator: ['en_route', 'in_progress', 'completed']
-  };
+### 5.1 No Skipping Steps
+- Status must follow defined order: PENDING → SCHEDULED → ASSIGNED → IN_PROGRESS → COMPLETED
 
-  if (!rules[role].includes(nextStatus)) {
-    throw new Error("FORBIDDEN");
-  }
-}
-```
+### 5.2 Resource Locking
+- **At ASSIGNED**: Operator availability → `busy`, Tractor status → `IN_USE`.
+- **At COMPLETED**: Operator availability → `available`, Tractor status → `AVAILABLE`.
+
+### 5.3 Maintenance Rule
+- Tractors with `< 50` hours remaining until next service are auto-flagged as `MAINTENANCE`.
+- Maintenance tractors cannot be assigned to new bookings.
 
 ---
 
-## 6. User Registration & Lifecycle
+## 6. Notification Flow
 
-To ensure security and fleet integrity, user account creation is strictly controlled:
+Notifications are triggered at key lifecycle events:
 
-### 6.1 Public Registration (Farmer)
-- **Actor**: Any potential user.
-- **Role**: Limited to `farmer`.
-- **Enforcement**: Role field is hardcoded/restricted in the public registration form.
-
-### 6.2 Admin-Controlled Enrollment (Operator/Admin)
-- **Actor**: Existing Admin.
-- **Role**: `operator` or `admin`.
-- **Enforcement**: Created through the Admin Management Portal. Operators cannot self-register.
-
-### 6.3 Profile Management
-- **Farmers**: Can update name and location.
-- **Operators**: Can update name, email, and phone.
-- **Security**: Password changes require providing the `oldPassword` for verification.
+| Event | Recipients | Type |
+|:---|:---|:---|
+| Booking Created | Admin | `booking` |
+| Payment Received | Admin | `payment` |
+| Booking Scheduled | Farmer | `booking` |
+| Operator Assigned | Operator + Farmer | `assignment` |
+| Job Completed | Farmer + Admin | `tracking` |
 
 ---
 
-## 7. Summary
+## 7. Real-Time Tracking Flow
+
+Operators broadcast their location via Socket.IO during `IN_PROGRESS` state.
+- **Room**: `track-booking-{bookingId}` for Farmer.
+- **Admin Room**: `admin-tracking` for global fleet monitoring.
+
+---
+
+## 8. User Registration & Auth
+
+### 8.1 Authentication
+- Primary identifier: **Phone Number**.
+- System automatically generates an internal email for every user: `phone@tractorlink.app`.
+
+### 8.2 Role-Based Registry
+- **Farmers**: Can self-register or be added by Admin via the Registry Enrollment.
+- **Operators**: Must be added by Admin. They are tied to a specific tractor.
+
+---
+
+## 9. Summary
 
 This flow ensures:
-
-- Strict lifecycle control
-- No invalid transitions
-- Proper resource management
-- Clear role-based actions
-- Controlled user onboarding
-
-This is critical for maintaining system consistency and operational reliability.
+- Mandatory digital payments for service security.
+- Accurate distance-based pricing with Nigerian terrain adjustments.
+- Automated maintenance tracking for fleet longevity.
+- Real-time location visibility for farmers.
