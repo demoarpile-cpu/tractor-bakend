@@ -25,6 +25,7 @@ model User {
   fuelLogs         FuelLog[] @relation("OperatorFuelLogs")
   tractor          Tractor?       @relation("OperatorTractor")
   notifications    Notification[] @relation("UserNotifications")
+  fuelLogsReviewed FuelLog[]      @relation("AdminFuelLogReviews")
 
   @@map("users")
 }
@@ -103,6 +104,8 @@ model Booking {
   roadDistance        Float     @default(0) @map("road_distance")
   serviceNameSnapshot String?   @map("service_name_snapshot")
   scheduledAt         DateTime? @map("scheduled_at")
+  source              String    @default("WEB")
+  locationFixed       Boolean   @default(true) @map("location_fixed")
   farmer              User      @relation("FarmerBookings", fields: [farmerId], references: [id])
   operator            User?     @relation("OperatorBookings", fields: [operatorId], references: [id])
   service             Service   @relation(fields: [serviceId], references: [id])
@@ -157,11 +160,16 @@ model FuelLog {
   station    String
   receiptUrl String?  @map("receipt_url")
   createdAt  DateTime @default(now()) @map("created_at")
+  status     String   @default("PENDING")
+  reviewedBy Int?     @map("reviewed_by")
+  reviewedAt DateTime? @map("reviewed_at")
   operator   User     @relation("OperatorFuelLogs", fields: [operatorId], references: [id])
   tractor    Tractor? @relation("TractorFuelLogs", fields: [tractorId], references: [id])
+  reviewer   User?    @relation("AdminFuelLogReviews", fields: [reviewedBy], references: [id])
 
   @@index([operatorId], map: "fuel_logs_operator_id_fkey")
   @@index([tractorId], map: "fuel_logs_tractor_id_fkey")
+  @@index([reviewedBy], map: "fuel_logs_reviewed_by_fkey")
   @@map("fuel_logs")
 }
 
@@ -186,4 +194,15 @@ model Notification {
   user      User     @relation("UserNotifications", fields: [userId], references: [id])
 
   @@map("notifications")
+}
+
+model UssdLocation {
+  id                Int      @id @default(autoincrement())
+  name              String   @unique
+  chargePerHectare  Float    @map("charge_per_hectare")
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("ussd_locations")
 }
